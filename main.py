@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse,JSONResponse
 import httpx,websockets,uvicorn
 BAL=float(os.getenv("START_BALANCE","150"));RISK=float(os.getenv("RISK_PCT",".02"));MAXP=int(os.getenv("MAX_POSITIONS","30"));MAXR=float(os.getenv("MAX_TOTAL_RISK_PCT",".10"));TOP=int(os.getenv("TOP_N","300"));MON=int(os.getenv("MONITOR_N","100"));TP=float(os.getenv("TP_PCT",".0045"));SL=float(os.getenv("SL_PCT",".0025"));TSTOP=float(os.getenv("TIME_STOP_SEC","120"));COOL=float(os.getenv("COOLDOWN_SEC","60"));TH=float(os.getenv("SIGNAL_SCORE","70"));PORT=int(os.getenv("PORT","8080"))
 app=FastAPI();S={"balance":BAL,"pnl":0.0,"positions":{},"events":deque(maxlen=150),"symbols":[],"ws":"DISCONNECTED","last_market":0,"last_error":"","trades":0,"wins":0,"losses":0,"fees":0.0,"long_setups":0,"short_setups":0,"entries_blocked":0};T=defaultdict(lambda:deque(maxlen=600));BOOK=defaultdict(lambda:{"b":{},"a":{},"imb":0.0,"mid":0.0});D={};last=defaultdict(float)
-def clip(x):return max(-1,min(1,x))
+def clip(x,a=-1,b=1):return max(a,min(b,x))
 def metrics(s):
  f=T[s]
  if len(f)<12:return
@@ -69,7 +69,7 @@ async def loop():
    async with httpx.AsyncClient(timeout=15) as c:d=await c.get("https://api.bybit.com/v5/market/tickers?category=linear");j=d.json()
    rows=sorted([(float(x.get("turnover24h") or 0),x["symbol"]) for x in j.get("result",{}).get("list",[]) if x["symbol"].endswith("USDT")],reverse=True);S["symbols"]=[x[1] for x in rows[:TOP]]
    async with websockets.connect("wss://stream.bybit.com/v5/public/linear",ping_interval=20,ping_timeout=10,max_size=2**22) as ws:
-    S["ws"]="CONNECTED";sy=S["symbols"][:MON]
+    S["ws"]="CONNECTED";S["last_error"]="";sy=S["symbols"][:MON]
     for i in range(0,len(sy),10):
      batch=sy[i:i+10];await ws.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{x}" for x in batch]+[f"orderbook.50.{x}" for x in batch]}));await asyncio.sleep(.12)
     async for raw in ws:
