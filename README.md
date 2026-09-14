@@ -1,18 +1,12 @@
-# Bybit Micro Scalper v9
+# Bybit Micro Scalper v10
 
-Paper-only research bot for Railway.
+Paper-only event-driven scalper.
 
-Key changes from v8:
-- 0.5% risk per trade instead of 2%
-- 0.60% TP / 0.25% SL
-- 10% aggregate open-risk cap
-- fee + slippage model
-- 3-of-4 microstructure confluence: CVD, order book, 5s momentum, flow impulse
-- spread and expected-move filters
-- anti-late-chase filter
-- reversal exit
-- 180s dead-trade timeout
-- separate LONG/SHORT and exit-reason statistics
-- session loss guard at 10%
+Unlike v9, score alone cannot open a trade. A concrete market event is required:
+- SWEEP_REVERSAL
+- ABSORPTION
+- PULLBACK_CONT
 
-No real orders are sent.
+The dashboard reports performance separately by event type so the strategy can be rejected or refined based on evidence rather than arbitrary score tuning.
+
+No private Bybit API or real order endpoint is used.
