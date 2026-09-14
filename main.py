@@ -1,179 +1,66 @@
-
-import os, time, json, math, asyncio
-from collections import defaultdict, deque
+import os,time,json,asyncio
+from collections import defaultdict,deque
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
-import httpx
-import websockets
-
-START_BALANCE=float(os.getenv("START_BALANCE","10000"))
-RISK_PCT=float(os.getenv("RISK_PCT","0.02"))
-LEVERAGE=float(os.getenv("LEVERAGE","10"))
-MAX_POSITIONS=int(os.getenv("MAX_POSITIONS","30"))
-TOP_N=int(os.getenv("TOP_N","300"))
-MONITOR_N=int(os.getenv("MONITOR_N","80"))
-TP_PCT=float(os.getenv("TP_PCT","0.006"))
-SL_PCT=float(os.getenv("SL_PCT","0.0025"))
-TIME_STOP=float(os.getenv("TIME_STOP_SEC","180"))
-COOLDOWN=float(os.getenv("COOLDOWN_SEC","60"))
-SIGNAL_SCORE=float(os.getenv("SIGNAL_SCORE","72"))
-PORT=int(os.getenv("PORT","8080"))
-
-app=FastAPI()
-state={
- "balance":START_BALANCE,"equity":START_BALANCE,"positions":{},
- "signals":deque(maxlen=100),"symbols":[], "ws":"DISCONNECTED",
- "trades":0,"wins":0,"losses":0,"pnl":0.0,"last_error":"",
- "last_market":0
-}
-books={}
-flows=defaultdict(lambda: deque(maxlen=120))
-prices={}
-last_entry=defaultdict(float)
-
-def clamp(x,a,b): return max(a,min(b,x))
-
-async def rest_symbols():
-    url="https://api.bybit.com/v5/market/tickers?category=linear"
-    async with httpx.AsyncClient(timeout=15) as c:
-        r=(await c.get(url)).json()
-    rows=[]
-    for x in r.get("result",{}).get("list",[]):
-        s=x.get("symbol","")
-        if not s.endswith("USDT"): continue
-        try: turn=float(x.get("turnover24h") or 0)
-        except: turn=0
-        rows.append((turn,s))
-    rows.sort(reverse=True)
-    return [s for _,s in rows[:TOP_N]]
-
-def score(s):
-    f=flows[s]
-    if len(f)<8: return None
-    now=time.time()
-    recent=[x for x in f if now-x[0] <= 20]
-    old=[x for x in f if 20 < now-x[0] <= 60]
-    if len(recent)<3: return None
-    rv=sum(x[1] for x in recent); ov=sum(x[1] for x in old)
-    cvd=clamp(rv/(sum(abs(x[1]) for x in recent)+1e-9),-1,1)
-    accel=clamp((rv/(len(recent))) / (abs(ov)/(len(old))+1e-9),-3,3) if old else 0
-    p=prices.get(s,0)
-    pts=0
-    if cvd>0.45: pts+=28
-    elif cvd<-0.45: pts-=28
-    if accel>1.5 and rv>0: pts+=18
-    elif accel>1.5 and rv<0: pts-=18
-    b=books.get(s,{})
-    imb=b.get("imb",0)
-    pts += 22*clamp(imb,-1,1)
-    px0=b.get("px0",p)
-    if px0:
-        move=(p/px0)-1
-        if move>0.001: pts+=18
-        elif move<-0.001: pts-=18
-    vol=sum(abs(x[1]) for x in recent)
-    if vol>0: pts += 14*(1 if abs(cvd)>0.65 else 0)
-    return pts, cvd, imb, accel
-
-def open_pos(s,side,px,sc):
-    if s in state["positions"] or len(state["positions"])>=MAX_POSITIONS: return
-    if time.time()-last_entry[s]<COOLDOWN: return
-    risk=state["balance"]*RISK_PCT
-    stop_dist=px*SL_PCT
-    qty=risk/stop_dist
-    # leverage is reflected in notional; risk is still based on stop distance
-    notional=qty*px
-    pos={"symbol":s,"side":side,"entry":px,"qty":qty,"notional":notional,
-         "opened":time.time(),"score":round(sc,1)}
-    state["positions"][s]=pos
-    last_entry[s]=time.time()
-    state["signals"].appendleft({"t":time.time(),"symbol":s,"side":side,"price":px,"score":round(sc,1),"event":"ENTRY"})
-
-def close_pos(s,reason,px):
-    p=state["positions"].pop(s,None)
-    if not p:return
-    raw=(px-p["entry"])*p["qty"]*(1 if p["side"]=="LONG" else -1)
-    fee=(p["entry"]*p["qty"]+px*p["qty"])*0.00055
-    pnl=raw-fee
-    state["balance"]+=pnl; state["pnl"]+=pnl; state["trades"]+=1
-    if pnl>=0: state["wins"]+=1
-    else: state["losses"]+=1
-    state["signals"].appendleft({"t":time.time(),"symbol":s,"side":p["side"],"price":px,"pnl":round(pnl,2),"event":reason})
-
-async def process_trade(x):
-    s=x.get("s"); px=float(x.get("p") or 0); q=float(x.get("v") or 0)
-    if not s or not px or not q:return
-    side=x.get("S")
-    signed=q if side=="Buy" else -q
-    prices[s]=px; state["last_market"]=time.time()
-    flows[s].append((time.time(),signed*px))
-    sc=score(s)
-    if sc:
-        pts,cvd,imb,acc=sc
-        if s not in state["positions"]:
-            if pts>=SIGNAL_SCORE: open_pos(s,"LONG",px,pts)
-            elif pts<=-SIGNAL_SCORE: open_pos(s,"SHORT",px,pts)
-    p=state["positions"].get(s)
-    if p:
-        ret=(px/p["entry"]-1)*(1 if p["side"]=="LONG" else -1)
-        if ret>=TP_PCT: close_pos(s,"TP",px)
-        elif ret<=-SL_PCT: close_pos(s,"SL",px)
-        elif time.time()-p["opened"]>=TIME_STOP: close_pos(s,"TIME",px)
-
-async def subscribe(ws, symbols):
-    for i in range(0,len(symbols),10):
-        args=[f"publicTrade.{s}" for s in symbols[i:i+10]]
-        await ws.send(json.dumps({"op":"subscribe","args":args}))
-        await asyncio.sleep(.15)
-
-async def market_loop():
-    while True:
-        try:
-            state["symbols"]=await rest_symbols()
-            subs=state["symbols"][:MONITOR_N]
-            url="wss://stream.bybit.com/v5/public/linear"
-            async with websockets.connect(url,ping_interval=20,ping_timeout=10,max_size=2**22) as ws:
-                state["ws"]="CONNECTED"
-                await subscribe(ws,subs)
-                async for msg in ws:
-                    d=json.loads(msg)
-                    if d.get("topic","").startswith("publicTrade."):
-                        for x in d.get("data",[]): await process_trade(x)
-        except Exception as e:
-            state["ws"]="DISCONNECTED"; state["last_error"]=str(e)
-            await asyncio.sleep(3)
-
+from fastapi.responses import HTMLResponse,JSONResponse
+import httpx,websockets,uvicorn
+BAL=float(os.getenv("START_BALANCE","150")); RISK=float(os.getenv("RISK_PCT",".02")); MAXP=int(os.getenv("MAX_POSITIONS","30")); TOP=int(os.getenv("TOP_N","300")); MON=int(os.getenv("MONITOR_N","100")); TP=float(os.getenv("TP_PCT",".006")); SL=float(os.getenv("SL_PCT",".0025")); TSTOP=float(os.getenv("TIME_STOP_SEC","180")); COOL=float(os.getenv("COOLDOWN_SEC","60")); TH=float(os.getenv("SIGNAL_SCORE","72")); PORT=int(os.getenv("PORT","8080"))
+app=FastAPI(); S={"balance":BAL,"equity":BAL,"positions":{},"events":deque(maxlen=100),"symbols":[],"ws":"DISCONNECTED","last_market":0,"last_error":"","trades":0,"wins":0,"losses":0,"pnl":0,"candidates":0,"long_setups":0,"short_setups":0}; F=defaultdict(lambda:deque(maxlen=300)); P={}; B=defaultdict(lambda:{"imb":0,"px":0}); last=defaultdict(float); diag={}
+def clip(x): return max(-1,min(1,x))
+def calc(s):
+ f=F[s]
+ if len(f)<5:return
+ n=time.time(); r=[x for x in f if n-x[0]<=20]; q=[x for x in f if 20<n-x[0]<=60]
+ if len(r)<3:return
+ rv=sum(x[1] for x in r); cv=clip(rv/(sum(abs(x[1]) for x in r)+1e-9)); old=abs(sum(x[1] for x in q))/max(1,len(q)); cur=abs(rv)/len(r); acc=cur/(old+1e-9); px=P[s]; b=B[s]; mv=px/(b["px"] or px)-1
+ sc=(28 if cv>.45 else -28 if cv<-.45 else 0)+(18 if acc>1.5 and rv>0 else -18 if acc>1.5 and rv<0 else 0)+22*clip(b["imb"])+(18 if mv>.001 else -18 if mv<-.001 else 0)+(14 if abs(cv)>.65 else 0)
+ return {"score":sc,"cvd":cv,"accel":acc,"imb":b["imb"],"move":mv,"flow":rv}
+def ev(x):S["events"].appendleft(x)
+def openp(s,side,px,sc):
+ if s in S["positions"] or len(S["positions"])>=MAXP or time.time()-last[s]<COOL:return
+ qty=S["balance"]*RISK/(px*SL); S["positions"][s]={"symbol":s,"side":side,"entry":px,"qty":qty,"opened":time.time(),"score":round(sc,1)}; last[s]=time.time(); ev({"t":time.time(),"event":"ENTRY","symbol":s,"side":side,"price":px,"score":round(sc,1)})
+def closep(s,reason,px):
+ p=S["positions"].pop(s,None)
+ if not p:return
+ pnl=(px-p["entry"])*p["qty"]*(1 if p["side"]=="LONG" else -1)-(p["entry"]+px)*p["qty"]*.00055
+ S["balance"]+=pnl; S["pnl"]+=pnl; S["trades"]+=1; S["wins"]+=pnl>=0; S["losses"]+=pnl<0; ev({"t":time.time(),"event":reason,"symbol":s,"side":p["side"],"price":px,"pnl":round(pnl,2)})
+async def trade(x):
+ s=x.get("s"); px=float(x.get("p") or 0); v=float(x.get("v") or 0)
+ if not s or not px or not v:return
+ P[s]=px; S["last_market"]=time.time(); F[s].append((time.time(),v*px*(1 if x.get("S")=="Buy" else -1))); z=calc(s)
+ if z:
+  diag[s]=z; S["candidates"]+=1
+  if z["score"]>=TH:S["long_setups"]+=1
+  if z["score"]<=-TH:S["short_setups"]+=1
+  if s not in S["positions"]:
+   if z["score"]>=TH:openp(s,"LONG",px,z["score"])
+   elif z["score"]<=-TH:openp(s,"SHORT",px,z["score"])
+ p=S["positions"].get(s)
+ if p:
+  ret=(px/p["entry"]-1)*(1 if p["side"]=="LONG" else -1)
+  if ret>=TP:closep(s,"TP",px)
+  elif ret<=-SL:closep(s,"SL",px)
+  elif time.time()-p["opened"]>=TSTOP:closep(s,"TIME",px)
+async def loop():
+ while 1:
+  try:
+   async with httpx.AsyncClient(timeout=15) as c:d=(await c.get("https://api.bybit.com/v5/market/tickers?category=linear")).json()
+   a=sorted([(float(x.get("turnover24h") or 0),x["symbol"]) for x in d["result"]["list"] if x["symbol"].endswith("USDT")],reverse=True); S["symbols"]=[x[1] for x in a[:TOP]]
+   async with websockets.connect("wss://stream.bybit.com/v5/public/linear",ping_interval=20,ping_timeout=10) as w:
+    S["ws"]="CONNECTED"
+    for i in range(0,MON,10):await w.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{s}" for s in S["symbols"][i:i+10]]}));await asyncio.sleep(.15)
+    async for m in w:
+     d=json.loads(m)
+     if d.get("topic","").startswith("publicTrade."):
+      for x in d["data"]:await trade(x)
+  except Exception as e:S["ws"]="DISCONNECTED";S["last_error"]=str(e);await asyncio.sleep(3)
 @app.get("/api/status")
-def api_status():
-    eq=state["balance"]
-    for s,p in state["positions"].items():
-        px=prices.get(s,p["entry"])
-        eq+=(px-p["entry"])*p["qty"]*(1 if p["side"]=="LONG" else -1)
-    state["equity"]=eq
-    return JSONResponse({
-      "balance":round(state["balance"],2),"equity":round(eq,2),
-      "positions":list(state["positions"].values()),"position_count":len(state["positions"]),
-      "max_positions":MAX_POSITIONS,"signals":list(state["signals"])[:30],
-      "symbols":len(state["symbols"]),"monitor":MONITOR_N,"ws":state["ws"],
-      "trades":state["trades"],"wins":state["wins"],"losses":state["losses"],
-      "pnl":round(state["pnl"],2),"last_market":state["last_market"],"last_error":state["last_error"]
-    })
-
+def status():
+ eq=S["balance"]
+ for s,p in S["positions"].items():eq+=(P.get(s,p["entry"])-p["entry"])*p["qty"]*(1 if p["side"]=="LONG" else -1)
+ z=sorted(diag.items(),key=lambda x:abs(x[1]["score"]),reverse=True)[:15]
+ return JSONResponse({"balance":round(S["balance"],2),"equity":round(eq,2),"pnl":round(S["pnl"],2),"ws":S["ws"],"positions":list(S["positions"].values()),"position_count":len(S["positions"]),"max_positions":MAXP,"monitor":MON,"candidates":S["candidates"],"long_setups":S["long_setups"],"short_setups":S["short_setups"],"trades":S["trades"],"wins":S["wins"],"losses":S["losses"],"last_market":S["last_market"],"last_error":S["last_error"],"diagnostics":[{"symbol":k,**v} for k,v in z],"events":list(S["events"])[:30]})
 @app.get("/",response_class=HTMLResponse)
 def home():
-    return """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Bybit Scalper</title><style>body{font-family:system-ui;background:#111;color:#eee;margin:16px} .box{padding:14px;border:1px solid #333;border-radius:12px;margin:8px 0}pre{white-space:pre-wrap;font-size:12px}</style></head>
-<body><h2>⚡ Bybit Micro Scalper — PAPER</h2><div id=a></div><div class=box><b>Recent events</b><pre id=s></pre></div>
-<script>
-async function go(){let x=await fetch('/api/status').then(r=>r.json());
-document.getElementById('a').innerHTML=`<div class=box>Balance: $${x.balance}<br>Equity: $${x.equity}<br>PnL: $${x.pnl}<br>WS: ${x.ws}<br>Positions: ${x.position_count}/${x.max_positions}<br>Monitored: ${x.monitor}<br>Trades: ${x.trades} | W/L: ${x.wins}/${x.losses}<br>Last market: ${x.last_market?new Date(x.last_market*1000).toLocaleTimeString():'-' }<br>Error: ${x.last_error||'-'}</div>`;
-document.getElementById('s').textContent=x.signals.map(z=>new Date(z.t*1000).toLocaleTimeString()+' '+z.event+' '+z.symbol+' '+z.side+' '+(z.price||'')+' score='+(z.score||'')+' pnl='+(z.pnl||'')).join('\\n');}
-go();setInterval(go,1000)</script></body></html>"""
-
+ return """<meta name=viewport content="width=device-width,initial-scale=1"><style>body{font:14px system-ui;background:#111;color:#eee;margin:14px}.box{border:1px solid #333;border-radius:12px;padding:12px;margin:8px 0}table{width:100%;font-size:11px}td,th{padding:4px;text-align:right}td:first-child,th:first-child{text-align:left}pre{font-size:11px}</style><h2>⚡ Micro Scalper — DIAGNOSTIC</h2><div id=a class=box></div><div class=box><b>Live scores</b><div style="overflow:auto"><table id=t></table></div></div><div class=box><b>Events</b><pre id=e></pre></div><script>async function g(){let x=await fetch('/api/status').then(r=>r.json());a.innerHTML=`Balance $${x.balance} | Equity $${x.equity} | PnL $${x.pnl}<br>WS ${x.ws} | Positions ${x.position_count}/${x.max_positions} | Monitor ${x.monitor}<br>Calculations ${x.candidates} | LONG ${x.long_setups} | SHORT ${x.short_setups}<br>Trades ${x.trades} W/L ${x.wins}/${x.losses}<br>Last ${x.last_market?new Date(x.last_market*1000).toLocaleTimeString():'-'} | Error ${x.last_error||'-'}`;t.innerHTML='<tr><th>Symbol</th><th>Score</th><th>CVD</th><th>Book</th><th>Move</th><th>Accel</th></tr>'+x.diagnostics.map(z=>`<tr><td>${z.symbol}</td><td>${z.score.toFixed(1)}</td><td>${z.cvd.toFixed(2)}</td><td>${z.imb.toFixed(2)}</td><td>${(z.move*100).toFixed(3)}%</td><td>${z.accel.toFixed(2)}</td></tr>`).join('');e.textContent=x.events.map(z=>new Date(z.t*1000).toLocaleTimeString()+' '+z.event+' '+z.symbol+' '+z.side+' '+(z.price||'')+' score='+(z.score||'')+' pnl='+(z.pnl??'')).join('\n')}g();setInterval(g,1000)</script>"""
 @app.on_event("startup")
-async def startup():
-    asyncio.create_task(market_loop())
-
-if __name__=="__main__":
-    uvicorn.run(app,host="0.0.0.0",port=PORT)
+async def start():asyncio.create_task(loop())
