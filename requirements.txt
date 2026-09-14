@@ -1,4 +1,0 @@
-fastapi>=0.115
-aiohttp>=3.10
-websockets>=13
-uvicorn[standard]>=0.30
