@@ -1,7 +1,0 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-aiohttp>=3.10
-websockets>=13
-pandas>=2.2
-numpy>=2.0
-python-dotenv>=1.0
