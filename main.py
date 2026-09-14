@@ -37,7 +37,7 @@ def closep(s,why,px):
 async def trade(x):
  s=x.get("s");px=float(x.get("p") or 0);v=float(x.get("v") or 0)
  if not s or not px or not v:return
- P[s]=px;S["last_market"]=time.time();F[s].append((time.time(),v*px*(1 if x.get("S")=="Buy" else -1)));z=calc(s)
+ P[s]=px;S["last_market"]=time.time();F[s].append((time.time(),v*px*(1 if x.get("S")=="Buy" else -1),px));z=calc(s)
  if z:
   diag[s]=z;S["calculations"]+=1
   if z["score"]>=TH:S["long_setups"]+=1;openp(s,"LONG",px,z["score"])
@@ -48,6 +48,13 @@ async def trade(x):
   if ret>=TP:closep(s,"TP",px)
   elif ret<=-SL:closep(s,"SL",px)
   elif time.time()-p["opened"]>=TSTOP:closep(s,"TIME",px)
+def apply_book(d):
+ topic=d.get("topic","");s=topic.split(".")[-1];data=d.get("data",{})
+ bids=data.get("b",[]);asks=data.get("a",[])
+ if not bids or not asks:return
+ bid=sum(float(x[1]) for x in bids[:20]);ask=sum(float(x[1]) for x in asks[:20])
+ BOOK[s]={"bid":bid,"ask":ask,"imb":clip((bid-ask)/(bid+ask+1e-9)),"mid":(float(bids[0][0])+float(asks[0][0]))/2}
+
 async def loop():
  while 1:
   try:
@@ -55,7 +62,10 @@ async def loop():
    a=sorted([(float(x.get("turnover24h") or 0),x["symbol"]) for x in d["result"]["list"] if x["symbol"].endswith("USDT")],reverse=True);S["symbols"]=[x[1] for x in a[:TOP]]
    async with websockets.connect("wss://stream.bybit.com/v5/public/linear",ping_interval=20,ping_timeout=10) as w:
     S["ws"]="CONNECTED"
-    for i in range(0,MON,10):await w.send(json.dumps({"op":"subscribe","args":[f"publicTrade.{s}" for s in S["symbols"][i:i+10]]}));await asyncio.sleep(.1)
+    for i in range(0,MON,10):
+     batch=S["symbols"][i:i+10]
+     args=[f"publicTrade.{s}" for s in batch]+[f"orderbook.50.{s}" for s in batch]
+     await w.send(json.dumps({"op":"subscribe","args":args}));await asyncio.sleep(.1)
     async for m in w:
      d=json.loads(m)
      if d.get("topic","").startswith("publicTrade."):
