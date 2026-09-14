@@ -3,28 +3,23 @@ from collections import defaultdict,deque
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse,JSONResponse
 import httpx,websockets,uvicorn
+BOOK=defaultdict(lambda:{'bid':0.0,'ask':0.0,'imb':0.0,'mid':0.0})
 BAL=float(os.getenv("START_BALANCE","150"));RISK=float(os.getenv("RISK_PCT",".02"));MAXP=int(os.getenv("MAX_POSITIONS","30"));TOP=int(os.getenv("TOP_N","300"));MON=int(os.getenv("MONITOR_N","100"));TP=float(os.getenv("TP_PCT",".006"));SL=float(os.getenv("SL_PCT",".0025"));TSTOP=float(os.getenv("TIME_STOP_SEC","180"));COOL=float(os.getenv("COOLDOWN_SEC","60"));TH=float(os.getenv("SIGNAL_SCORE","65"));PORT=int(os.getenv("PORT","8080"))
 app=FastAPI();S={"balance":BAL,"pnl":0,"positions":{},"events":deque(maxlen=100),"symbols":[],"ws":"DISCONNECTED","last_market":0,"last_error":"","trades":0,"wins":0,"losses":0,"calculations":0,"long_setups":0,"short_setups":0};F=defaultdict(lambda:deque(maxlen=300));P={};last=defaultdict(float);diag={}
 def clip(x):return max(-1,min(1,x))
 def calc(s):
  f=F[s]
  if len(f)<8:return None
- n=time.time()
- r=[x for x in f if n-x[0]<=15]
- q=[x for x in f if 15<n-x[0]<=45]
+ n=time.time(); r=[x for x in f if n-x[0]<=15]; q=[x for x in f if 15<n-x[0]<=45]
  if len(r)<4:return None
- rv=sum(x[1] for x in r)
- cv=clip(rv/(sum(abs(x[1]) for x in r)+1e-9))
- new_abs=sum(abs(x[1]) for x in r)
- old_abs=sum(abs(x[1]) for x in q)
- activity=clip((new_abs/max(1,len(r)))/(old_abs/max(1,len(q))+1e-9)-1)
- p0=r[0][2];p1=r[-1][2]
- move=clip((p1/p0-1)/0.003) if p0 else 0
- # 100-point score: flow 30, acceleration 20, book 25, momentum 15, activity 10
+ rv=sum(x[1] for x in r); cv=clip(rv/(sum(abs(x[1]) for x in r)+1e-9))
+ na=sum(abs(x[1]) for x in r)/len(r); oa=sum(abs(x[1]) for x in q)/max(1,len(q))
+ acc=clip(na/(oa+1e-9)-1)
+ p0=r[0][2]; p1=r[-1][2]; move=clip((p1/p0-1)/0.003) if p0 else 0
  imb=clip(BOOK[s]["imb"])
- score=30*cv + 20*activity*(1 if rv>=0 else -1) + 25*imb + 15*move
- if abs(activity)>.5: score += 10*(1 if rv>0 else -1)
- return {"score":score,"cvd":cv,"accel":activity,"imb":imb,"move":move,"flow":rv}
+ score=30*cv+20*acc*(1 if rv>=0 else -1)+25*imb+15*move
+ if abs(acc)>.5:score+=10*(1 if rv>0 else -1)
+ return {"score":score,"cvd":cv,"accel":acc,"imb":imb,"move":move,"flow":rv}
 
 def ev(x):S["events"].appendleft(x)
 def openp(s,side,px,sc):
@@ -64,8 +59,9 @@ async def loop():
     S["ws"]="CONNECTED"
     for i in range(0,MON,10):
      batch=S["symbols"][i:i+10]
-     args=[f"publicTrade.{s}" for s in batch]+[f"orderbook.50.{s}" for s in batch]
-     await w.send(json.dumps({"op":"subscribe","args":args}));await asyncio.sleep(.1)
+     args=[f"publicTrade.{x}" for x in batch]+[f"orderbook.50.{x}" for x in batch]
+     await w.send(json.dumps({"op":"subscribe","args":args}))
+     await asyncio.sleep(.12)
     async for m in w:
      d=json.loads(m)
      if d.get("topic","").startswith("publicTrade."):
