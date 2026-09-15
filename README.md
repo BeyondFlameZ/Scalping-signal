@@ -1,12 +1,15 @@
-# Bybit Micro Scalper v10
+# Bybit Micro Scalper v11
 
-Paper-only event-driven scalper.
+Paper-only event-driven research bot.
 
-Unlike v9, score alone cannot open a trade. A concrete market event is required:
-- SWEEP_REVERSAL
-- ABSORPTION
-- PULLBACK_CONT
+v11 fixes a critical v10 bug where event name and score were swapped.
+It also removes the overly sensitive reversal churn:
+- reversal exit requires at least 20 seconds in the trade;
+- at least 0.10% adverse price movement;
+- strong opposite CVD;
+- stronger opposite-flow gap;
+- cooldown increased to 120 seconds;
+- event score default raised to 76;
+- dashboard event statistics use stable string keys.
 
-The dashboard reports performance separately by event type so the strategy can be rejected or refined based on evidence rather than arbitrary score tuning.
-
-No private Bybit API or real order endpoint is used.
+No private API and no real orders.

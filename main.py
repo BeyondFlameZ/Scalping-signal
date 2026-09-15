@@ -32,13 +32,13 @@ MONITOR_N = int(os.getenv("MONITOR_N", "100"))
 TP_PCT = float(os.getenv("TP_PCT", "0.006"))
 SL_PCT = float(os.getenv("SL_PCT", "0.0025"))
 TIME_STOP_SEC = int(os.getenv("TIME_STOP_SEC", "180"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "90"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "120"))
 
 TAKER_FEE = float(os.getenv("TAKER_FEE", "0.00055"))
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.00015"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.0012"))
 
-MIN_EVENT_SCORE = float(os.getenv("MIN_EVENT_SCORE", "72"))
+MIN_EVENT_SCORE = float(os.getenv("MIN_EVENT_SCORE", "76"))
 EVAL_INTERVAL = float(os.getenv("EVAL_INTERVAL", "0.50"))
 
 app = Flask(__name__)
@@ -335,8 +335,8 @@ def open_position(sym, side, score, event, price):
         "notional":notional, "risk":risk,
         "score":score, "event":event, "opened":now()
     }
-    SIGNAL_STATS[event]["n"] += 1
-    log(f"ENTRY {side} {sym} {event} score={score:.1f} px={price:.6g}")
+    SIGNAL_STATS[str(event)]["n"] += 1
+    log(f"ENTRY {side} {sym} event={str(event)} score={float(score):.1f} px={price:.6g}")
 
 def close_position(sym, price, reason):
     global BALANCE, EQUITY, REALIZED_PNL, GROSS_PNL, FEES, SLIPPAGE_COST
@@ -372,9 +372,9 @@ def close_position(sym, price, reason):
         if net > 0: STATS["short_wins"] += 1
 
     STATS[reason.lower()] += 1
-    SIGNAL_STATS[p["event"]]["pnl"] += net
+    SIGNAL_STATS[str(p["event"])]["pnl"] += net
     if net > 0:
-        SIGNAL_STATS[p["event"]]["wins"] += 1
+        SIGNAL_STATS[str(p["event"])]["wins"] += 1
 
     COOLDOWN[sym] = now()+COOLDOWN_SEC
     log(f"EXIT {p['side']} {sym} {reason} event={p['event']} "
@@ -398,7 +398,7 @@ def manage_positions():
             close_position(sym,px,"SL")
             continue
 
-        if now()-p["opened"] >= TIME_STOP_SEC and abs(ret) < 0.0010:
+        if now()-p["opened"] >= TIME_STOP_SEC and abs(ret) < 0.0010 and now()-p["opened"] >= 30:
             close_position(sym,px,"TIME")
 
     EQUITY = BALANCE+unreal
@@ -418,14 +418,19 @@ def evaluate(sym):
     # Existing positions: reversal is a management event, not a new entry.
     if sym in POSITIONS:
         p = POSITIONS[sym]
+        age = now() - p["opened"]
         d = 1 if p["side"]=="LONG" else -1
         opp = f["cvd"]*(-d)
         own = f["cvd"]*d
-        if opp > 0.60 and opp > own+0.35:
+        adverse = (f["price"]-p["entry"])/p["entry"]*d < -0.0010
+
+        # Do not churn on 1-2 second CVD flips. A reversal needs:
+        # minimum hold + meaningful adverse price movement + strong opposite flow.
+        if age >= 20 and adverse and opp > 0.72 and opp > own + 0.40:
             close_position(sym,f["price"],"REVERSAL")
         return
 
-    side, score, event = event_signal(sym,f)
+    side, event, score = event_signal(sym,f)
     if side:
         open_position(sym,side,score,event,f["price"])
 
